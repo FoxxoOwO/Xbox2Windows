@@ -31,30 +31,38 @@ def write_fixture(path, records, labels):
 
 def write_compressed_fixture(path, records, streams):
     assert len(streams) == 3 and all(0 < len(stream) <= ALIGNMENT for stream in streams)
-    count = DISTANT + 3
+    spans = [(streams[0], 1)] * (DISTANT + 1)
+    spans[1] = streams[1], 1
+    spans[-1] = streams[2], 1
+    write_intervals(path, records, spans)
+
+
+def write_intervals(path, records, spans):
+    count = len(spans) + 2
     metadata_start = round_up(16 + count * 8, ALIGNMENT)
     metadata_size = round_up(16 + records * (16 + 8 + 32), PAGE)
-    first = metadata_start + metadata_size
-    extent = first + (DISTANT + 1) * ALIGNMENT
-    logical_size = metadata_size + (DISTANT + 1) * PAGE
+    offset = metadata_start + metadata_size
+    logical = metadata_size
+    extent = offset + sum(round_up(len(stream), ALIGNMENT) for stream, _ in spans)
+    logical_size = logical + sum(pages * PAGE for _, pages in spans)
     data = bytearray(extent)
     struct.pack_into("<4sIQ", data, 0, b"RDS5", count, logical_size)
     struct.pack_into("<4sIII", data, metadata_start, b"ETPF", 0x27a, records, records * 24)
-    # All descriptors point at the first compressed page in this source-built archive.
     descriptor = struct.pack("<4I", 0, 0, metadata_size // PAGE, 0)
     data[metadata_start + 16:metadata_start + 16 + records * 16] = descriptor * records
 
-    def boundary(index, stored, logical, codec=0, padding=0):
-        entry = (stored // ALIGNMENT) | (codec << 26) | ((logical // PAGE) << 30) | (padding << 52)
+    def boundary(index, stored, logical_position, codec=0, padding=0):
+        entry = (stored // ALIGNMENT) | (codec << 26) | ((logical_position // PAGE) << 30) | (padding << 52)
         struct.pack_into("<Q", data, 16 + 8 * index, entry)
 
     boundary(0, metadata_start, 0)
-    for i in range(DISTANT + 1):
-        offset = first + i * ALIGNMENT
-        stream = streams[2 if i == DISTANT else 1 if i == 1 else 0]
-        boundary(i + 1, offset, metadata_size + i * PAGE, 8, ALIGNMENT - len(stream))
+    for index, (stream, pages) in enumerate(spans, start=1):
+        aligned = round_up(len(stream), ALIGNMENT)
+        boundary(index, offset, logical, 8, aligned - len(stream))
         data[offset:offset + len(stream)] = stream
-    boundary(count - 1, extent, logical_size)
+        offset += aligned
+        logical += pages * PAGE
+    boundary(count - 1, offset, logical)
     path.write_bytes(data)
 
 
@@ -103,7 +111,7 @@ def check(consumer, folder):
         batch, file, offset, _ = spec
         page = bytes([0xa5 if tag is None else tag]) * PAGE
         actual = data[i * stride:(i + 1) * stride]
-        assert statuses[i] == (0x80004005 if tag is None else 0), (spec, hex(statuses[i]))
+        assert statuses[i] == (0x80070026 if tag is None else 0), (spec, hex(statuses[i]))
         assert actual == GUARD + page + GUARD, (spec, "changed guard or wrong bytes")
         if batch >= 2 and offset == (0x8100, 0xe8100)[file] + SHIFT:
             assert actual[len(GUARD):-len(GUARD)] != bytes([labels[file][0]]) * PAGE

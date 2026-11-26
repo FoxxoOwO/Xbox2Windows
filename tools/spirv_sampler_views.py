@@ -31,7 +31,11 @@ def strip_comments(assembly):
 
 
 def read_module(lines):
-    """Collect result definitions, sample instructions and decorations from the assembly lines."""
+    """Collect result definitions, sample instructions and decorations from the assembly lines.
+
+    Besides the samples and gathers, an `OpImageQueryLod` is an ordinary use of its sampled image: HLSL
+    `CalculateLevelOfDetail` takes a `SamplerState`, never a comparison sampler.
+    """
     module = {"defs": {}, "comparisons": [], "ordinary": [], "decorated": set(), "indirect": False,
               "sets": {}, "bindings": {}}
     for index, line in enumerate(lines):
@@ -50,7 +54,8 @@ def read_module(lines):
         module["defs"][words[0]] = words[2:]
         if words[2].startswith("OpImage") and "Dref" in words[2]:
             module["comparisons"].append((index, words))
-        elif words[2].startswith(("OpImageSample", "OpImageGather", "OpImageSparseSample", "OpImageSparseGather")):
+        elif words[2] == "OpImageQueryLod" or words[2].startswith(
+                ("OpImageSample", "OpImageGather", "OpImageSparseSample", "OpImageSparseGather")):
             module["ordinary"].append(words)
     return module
 

@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <cstdint>
+#include <vector>
 
 using Word = std::uint64_t;
 extern "C" __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(const GUID*, void**);
@@ -27,7 +28,12 @@ const wchar_t* archive_name;
 Inputs inputs{};
 Ptr file = nullptr, queue = nullptr, status = nullptr;
 constexpr unsigned page = 4096;
-std::array<unsigned char, 2 * page> blocks;
+constexpr unsigned guard = 32;
+struct Destination {
+    unsigned page_offset = 0;
+    std::vector<unsigned char> guarded;
+};
+std::array<Destination, 2> destinations;
 unsigned count = 0;
 FILE* trace = nullptr;
 
@@ -35,9 +41,13 @@ class CloseBatch {
 public:
     ~CloseBatch() {
         if (file) invoke<3, void>(file);
-        for (Ptr object : {file, status, queue})
-            if (object) invoke<2, unsigned>(object);
-        if (trace) std::fclose(trace);
+        const unsigned file_refs = file ? invoke<2, unsigned>(file) : 0;
+        const unsigned status_refs = status ? invoke<2, unsigned>(status) : 0;
+        const unsigned queue_refs = queue ? invoke<2, unsigned>(queue) : 0;
+        if (trace) {
+            std::fprintf(trace, "storage release %u %u %u\n", file_refs, status_refs, queue_refs);
+            std::fclose(trace);
+        }
     }
 };
 }
@@ -69,7 +79,8 @@ bool begin_batch()
     auto factory = static_cast<Ptr>(result);
     const GUID* iid = nullptr;
     const HRESULT file_result = invoke<4, HRESULT>(factory, archive_name, iid, &file);
-    const HRESULT queue_result = invoke<10, HRESULT>(factory, static_cast<const void*>(nullptr), iid, &queue);
+    const unsigned char queue_description[0x28] = {};
+    const HRESULT queue_result = invoke<10, HRESULT>(factory, static_cast<const void*>(queue_description), iid, &queue);
     const HRESULT status_result = invoke<5, HRESULT>(factory, 2u, "BC pages", iid, &status);
     invoke<2, unsigned>(factory);
     trace = std::fopen("ranges.txt", "w");
@@ -81,20 +92,25 @@ bool begin_batch()
     }
     const Word id = (Word{identity.nFileIndexHigh} << 32) | identity.nFileIndexLow;
     std::fprintf(trace, "file %016llx\n", id);
-    blocks.fill(0xa5);
     return true;
 }
 
-extern "C" __declspec(dllexport) unsigned enqueue_page(unsigned index, Word offset, unsigned size)
+extern "C" __declspec(dllexport) unsigned enqueue_page(unsigned index, Word offset, unsigned size, Word destination)
 {
-    if (count >= 2 || !size || (!count && !begin_batch())) return 0;
+    const unsigned capacity = static_cast<unsigned>(destination >> 32);
+    const unsigned page_offset = static_cast<unsigned>(destination);
+    if (count >= 2 || !size || (capacity != page && capacity != 16 * page) ||
+        page_offset % page || page_offset > capacity - page || (!count && !begin_batch())) return 0;
+    auto& output = destinations[count];
+    output.page_offset = page_offset;
+    output.guarded.assign(guard + capacity + guard, 0xa5);
     alignas(8) unsigned char record[0x48]{};
-    const Word fields[]{1, reinterpret_cast<Word>(blocks.data() + page * count), 0, page,
+    const Word fields[]{1, reinterpret_cast<Word>(output.guarded.data() + guard), 0, capacity,
                         reinterpret_cast<Word>(file), offset, size};
     std::memcpy(record, fields, sizeof(fields));
     invoke<3, void>(queue, record);
     invoke<4, void>(queue, status, count++);
-    std::fprintf(trace, "request %u %llu %u\n", index, static_cast<unsigned long long>(offset), size);
+    std::fprintf(trace, "request %u %llu %u %u %u\n", index, static_cast<unsigned long long>(offset), size, capacity, page_offset);
     return size;
 }
 
@@ -113,6 +129,13 @@ extern "C" __declspec(dllexport) unsigned draw_pages()
         const auto hr = invoke<4, HRESULT>(status, i);
         std::fprintf(trace, "status %08lx\n", static_cast<unsigned long>(hr));
         failed |= FAILED(hr);
+    }
+    std::array<unsigned char, 2 * page> blocks;
+    std::ofstream complete("destinations.bin", std::ios::binary);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& out = destinations[i];
+        if (!complete.write(reinterpret_cast<const char*>(out.guarded.data()), out.guarded.size())) return 5;
+        std::memcpy(blocks.data() + page * i, out.guarded.data() + guard + out.page_offset, page);
     }
     std::ofstream pages("pages.bin", std::ios::binary);
     if (!pages.write(reinterpret_cast<const char*>(blocks.data()), blocks.size())) return 5;

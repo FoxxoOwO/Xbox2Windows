@@ -1,6 +1,8 @@
 """Exercise the production shim using Windows placeholders and shared page views."""
 import ctypes as C
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 PAGE_BYTES = 65536
@@ -18,7 +20,78 @@ def bind(library, name, args, result):
     return function
 
 
+def permissive_count(path, count):
+    """Child process: one permissive XMemMapPhysicalPages call with a huge count, with array and without."""
+    library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
+    function = library.XMemMapPhysicalPages
+    function.argtypes, function.restype = [C.c_void_p, C.c_size_t, C.c_void_p], C.c_void_p
+    scatter = library.XMemMapPhysicalPagesScatter
+    scatter.argtypes, scatter.restype = [C.c_void_p, C.c_size_t, C.c_void_p], C.c_int
+    tokens = (C.c_size_t * 1)(0)
+    print("control", function(0x10000, 0, None), flush=True)  # a null array with no pages is a plain success
+    for args in ((None,), (tokens,)):
+        C.set_last_error(0)
+        result = function(0x10000, count, *args)
+        print("map", result, C.get_last_error(), flush=True)
+    C.set_last_error(0)
+    result = scatter((C.c_void_p * 1)(0x10000), count, tokens)
+    print("scatter", result, C.get_last_error(), flush=True)
+
+
+def check_permissive_count(path):
+    """A huge count must fail with ERROR_INVALID_PARAMETER, not abort the process on an allocation."""
+    environment = dict(os.environ, X2W_XMEM_PERMISSIVE="1")
+    done = subprocess.run([sys.executable, "-B", __file__, path, "--permissive-count", str(1 << 40)],
+                          env=environment, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, f"huge permissive count ended the process: {done.returncode:#x} {done.stderr}"
+    assert done.stdout.split() == ["control", "65536", "map", "None", "87", "map", "None", "87", "scatter", "0", "87"], done.stdout
+
+
+def scatter_failure(path):
+    """Child process: an unsorted scatter batch whose second address in mapping order fails."""
+    library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
+    kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
+    pointer, number, dword = C.c_void_p, C.c_size_t, C.c_ulong
+    allocate = bind(library, "XMemAllocatePhysicalPages", [number, C.POINTER(number), C.POINTER(number)], C.c_int)
+    scatter = bind(library, "XMemMapPhysicalPagesScatter", [C.POINTER(pointer), number, C.POINTER(number)], C.c_int)
+    reserve = bind(kernel, "VirtualAlloc2", [pointer, pointer, number, dword, dword, pointer, dword], pointer)
+    free = bind(kernel, "VirtualFree", [pointer, number, dword], C.c_int)
+    count, tokens = number(2), (number * 2)()
+    assert allocate(PHYSICAL_64K, C.byref(count), tokens) and count.value == 2
+    base = reserve(pointer(-1), None, 2 * PAGE_BYTES, WIN_RESERVE | RESERVE_PLACEHOLDER, NOACCESS, None, 0)
+    assert base, C.get_last_error()
+    bad = base + PAGE_BYTES
+    assert free(base, PAGE_BYTES, WIN_RELEASE | PRESERVE_PLACEHOLDER), C.get_last_error()
+    assert free(bad, 0, WIN_RELEASE), C.get_last_error()
+    assert reserve(pointer(-1), bad, PAGE_BYTES, WIN_RESERVE, READWRITE, None, 0) == bad, C.get_last_error()
+    destinations = (pointer * 2)(bad + 1, base)
+    assert not scatter(destinations, 2, tokens) and C.get_last_error() == 87
+    destinations[0] = bad
+    assert not scatter(destinations, 2, tokens)
+    error = C.get_last_error()
+    assert error
+    assert scatter((pointer * 1)(base), 1, tokens), "first view was not rolled back"
+    print(f"{bad:016X} {tokens[0] >> 4:x} {error}")
+
+
+def check_scatter_diagnostic(path):
+    environment = dict(os.environ, X2W_XMEM_PERMISSIVE="1", X2W_XMEM_SHARED_VIEWS="1",
+                       X2W_XMEM_TRACE_FAILED_BATCH="1")
+    done = subprocess.run([sys.executable, "-B", __file__, path, "--scatter-failure"],
+                          env=environment, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr
+    address, page, error = done.stdout.split()
+    unaligned = f"{int(address, 16) + 1:016X}"
+    base = f"{int(address, 16) - PAGE_BYTES:016X}"
+    assert f"failed stage=invalid-address index=0 address={unaligned} page=0x{page} error=87" in done.stderr, done.stderr
+    assert f"failed stage=map-view index=0 address={address} page=0x{page} error={error}" in done.stderr, done.stderr
+    assert f"failed batch map first={base} last={address} pages=2" in done.stderr, done.stderr
+    print("Permissive scatter diagnostics identify the caller index and page after address sorting and rollback")
+
+
 def main(path):
+    check_permissive_count(path)
+    check_scatter_diagnostic(path)
     library = C.WinDLL(str(Path(path).resolve()), use_last_error=True, winmode=0x900)
     kernel = C.WinDLL("kernelbase.dll", use_last_error=True)
     pointer, number = C.c_void_p, C.c_size_t
@@ -101,4 +174,9 @@ def main(path):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) == 4 and sys.argv[2] == "--permissive-count":
+        permissive_count(sys.argv[1], int(sys.argv[3]))
+    elif len(sys.argv) == 3 and sys.argv[2] == "--scatter-failure":
+        scatter_failure(sys.argv[1])
+    else:
+        main(sys.argv[1])

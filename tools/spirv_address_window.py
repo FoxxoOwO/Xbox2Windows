@@ -3,6 +3,7 @@ import argparse
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 
@@ -11,7 +12,7 @@ from spirv_sampler_views import split_sampler_views
 
 
 ID = r"%[A-Za-z0-9_]+"
-CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr64|arri|arrf|arr|ulong|uint|int|float) ({ID})")
+CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr64|arri|arrf|arrv4f|arr|ulong|uint|int|float|v4float) ({ID})")
 ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_uint ({ID}) ({ID})")
 SIGNED_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_int ({ID}) ({ID})")
 SIGNED_POINTER_TYPES = ("%_ptr_PSB_int = OpTypePointer PhysicalStorageBuffer %int",
@@ -26,6 +27,14 @@ FLOAT_ARRAY_DECLARATIONS = ("%float = OpTypeFloat 32", "%rt_float = OpTypeRuntim
                             "OpDecorate %rt_float ArrayStride 4")
 # A float access is a plain load or store of one naturally aligned 32-bit value; atomics are not offered on floats.
 FLOAT_MEMORY_OPERANDS = ([], ["Aligned", "4"])
+VEC4_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_v4float ({ID}) ({ID})")
+VEC4_POINTER_TYPES = ("%_ptr_PSB_v4float = OpTypePointer PhysicalStorageBuffer %v4float",
+                      "%_ptr_PSB_arrv4f = OpTypePointer PhysicalStorageBuffer %rt_v4float")
+VEC4_ARRAY_DECLARATIONS = ("%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4",
+                           "%rt_v4float = OpTypeRuntimeArray %v4float", "OpDecorate %rt_v4float ArrayStride 16")
+# A four-float access is a plain load or store of one naturally aligned 16-byte value. Physical accesses must carry
+# an Aligned operand, and only the natural alignment is accepted, as for a QWORD; other vector types are not lowered.
+VEC4_MEMORY_OPERANDS = (["Aligned", "16"],)
 CONSTANT = re.compile(rf"({ID}) = OpConstant %uint (\d+)")
 SIGNED_ATOMICS = {"OpAtomicSMin": "OpSLessThan", "OpAtomicSMax": "OpSGreaterThan"}
 # Atomics with no signedness, by operand count after the result type; their operands are bit-cast to unsigned.
@@ -55,22 +64,28 @@ def address_name(dst):
     return "%x2w_address_" + dst[1:]
 
 
-def word_pointer(dst, base, index, wide=False, defer=False):
+def word_pointer(dst, base, index, wide=False, defer=False, index_kind=None):
     """Select the last DWORD offset for an unaligned or unrepresentable address.
 
     Returns the lines and the ID of the boolean that is true only for an aligned, in-window address.
-    A wide (QWORD) or deferred pointer selects no substitute: it defines only the DWORD index {address}_word, and
-    the access issues in a branch taken for a valid address."""
+    A wide (QWORD, or "vec4" for sixteen bytes) or deferred pointer selects no substitute: it defines only the DWORD
+    index {address}_word, and the access issues in a branch taken for a valid address. A sixteen-byte access ends
+    twelve bytes before the window end, so that all four of its DWORDs are inside the window."""
     name = address_name(dst)
-    scale, mask, end = ("%x2w_shift_wide", "%x2w_mask_wide", "%x2w_end_wide") if wide else (
-        "%x2w_shift", "%x2w_mask", "%x2w_end")
+    scale, mask, end = ("%x2w_shift_vec4", "%x2w_mask_vec4", "%x2w_end_vec4") if wide == "vec4" else (
+        "%x2w_shift_wide", "%x2w_mask_wide", "%x2w_end_wide") if wide else ("%x2w_shift", "%x2w_mask", "%x2w_end")
     lines = []
     addr = base
     if index:
         addr = name + "_address"
+        if index_kind is None:
+            lines.append(f"{name}_index = OpUConvert %ulong {index}")
+            index = f"{name}_index"
+        elif index_kind == "s64":
+            lines.append(f"{name}_index = OpBitcast %ulong {index}")
+            index = f"{name}_index"
         lines.extend([
-            f"{name}_index = OpUConvert %ulong {index}",
-            f"{name}_delta = OpShiftLeftLogical %ulong {name}_index {scale}",
+            f"{name}_delta = OpShiftLeftLogical %ulong {index} {scale}",
             f"{addr} = OpIAdd %ulong {base} {name}_delta",
         ])
     lines.extend([
@@ -86,6 +101,14 @@ def word_pointer(dst, base, index, wide=False, defer=False):
             f"{name}_nowrap = OpUGreaterThanEqual %bool {addr} {base}",
             f"{valid} = OpLogicalAnd %bool {name}_valid {name}_nowrap",
         ])
+        if index_kind is not None:
+            # A 64-bit index can drop high bits when shifted left; reject any shift that wraps.
+            lines.extend([
+                f"{name}_unshifted = OpShiftRightLogical %ulong {name}_delta {scale}",
+                f"{name}_noshift = OpIEqual %bool {name}_unshifted {index}",
+                f"{name}_checked64 = OpLogicalAnd %bool {valid} {name}_noshift",
+            ])
+            valid = name + "_checked64"
     lines.extend([
         f"{name}_word64 = OpShiftRightLogical %ulong {addr} %x2w_shift",
         f"{name}_word = OpUConvert %uint {name}_word64",
@@ -246,6 +269,44 @@ def float_access(fields, pointers, valid_of, words, label, stem):
     return lines, stem + "_merge"
 
 
+def vec4_access(fields, pointers, valid_of, words, label, stem):
+    """Lower a four-float load or store into four DWORD accesses inside one branch taken only for a valid address.
+
+    The branch condition covers all sixteen bytes, so the four DWORDs are all accessed or none is. A load bit-casts
+    each word to a float and builds the vector; a store extracts each lane and bit-casts it to a word. Outside the
+    branch a load yields the zero vector (the bit pattern zero in every lane) and a store changes nothing.
+    Returns the lines and the label that follows."""
+    store = fields[0] == "OpStore"
+    pointer = fields[1] if store else fields[4]
+    operands = fields[3:] if store else fields[5:]
+    if store:
+        shape = len(fields) >= 3 and operands in VEC4_MEMORY_OPERANDS and fields[2] not in pointers
+    else:
+        shape = fields[1:4] == ["=", "OpLoad", "%v4float"] and fields[4:5] and operands in VEC4_MEMORY_OPERANDS
+    if not shape or pointer not in pointers or len(pointers) != 1:
+        raise ValueError("unhandled physical word pointer use")
+    word = words[pointer]
+    lines = [f"OpSelectionMerge {stem}_merge None", f"OpBranchConditional {valid_of[pointer]} {stem}_issue {stem}_merge",
+             f"{stem}_issue = OpLabel", f"{stem}_word_1 = OpIAdd %uint {word} %x2w_one",
+             f"{stem}_word_2 = OpIAdd %uint {word} %x2w_two", f"{stem}_word_3 = OpIAdd %uint {word} %x2w_three"]
+    lines.extend(f"{stem}_ptr_{lane} = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 {word if lane == 0 else f'{stem}_word_{lane}'}"
+                 for lane in range(4))
+    if store:
+        for lane in range(4):
+            lines.extend([f"{stem}_lane_{lane} = OpCompositeExtract %float {fields[2]} {lane}",
+                          f"{stem}_bits_{lane} = OpBitcast %uint {stem}_lane_{lane}",
+                          f"OpStore {stem}_ptr_{lane} {stem}_bits_{lane} Aligned 4"])
+        lines.extend([f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel"])
+        return lines, stem + "_merge"
+    for lane in range(4):
+        lines.extend([f"{stem}_bits_{lane} = OpLoad %uint {stem}_ptr_{lane}",
+                      f"{stem}_lane_{lane} = OpBitcast %float {stem}_bits_{lane}"])
+    lines.extend([f"{stem}_value = OpCompositeConstruct %v4float {' '.join(f'{stem}_lane_{lane}' for lane in range(4))}",
+                  f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel",
+                  f"{fields[0]} = OpPhi %v4float {stem}_value {stem}_issue %x2w_vec4_zero {label}"])
+    return lines, stem + "_merge"
+
+
 def merge_pointer_types(lines):
     # The push-constant and physical pointer types can become the same logical
     # pointer type. SPIR-V validation requires a single such declaration.
@@ -265,8 +326,38 @@ def merge_pointer_types(lines):
     return "\n".join(re.sub(ID, lambda m: aliases.get(m[0], m[0]), line) for line in kept) + "\n"
 
 
+def logical_lines(assembly):
+    """Instruction lines without `;` comments; a quoted string may span lines and may hold a `;`.
+
+    Quote and escape state carries across the whole module, and a literal that spans lines stays one
+    entry with its inner newlines and spaces untouched.
+    """
+    lines, current = [], []
+    quoted = escaped = False
+    comment = False
+    for char in assembly:
+        if char == "\n" and not quoted:
+            lines.append("".join(current).strip())
+            current, comment = [], False
+            continue
+        if comment:
+            continue
+        if quoted and escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif char == ";" and not quoted:
+            comment = True
+            continue
+        current.append(char)
+    lines.append("".join(current).strip())
+    return [line for line in lines if line]
+
+
 def lower(assembly):
-    lines = [line.strip() for line in split_sampler_views(lower_ballot_extract(assembly)).splitlines() if line.strip()]
+    lines = logical_lines(split_sampler_views(lower_ballot_extract(assembly)))
     model = "OpMemoryModel PhysicalStorageBuffer64 GLSL450"
     if model not in lines or lines.count("%user_data = OpVariable %_ptr_PC_UserData PushConstant") != 1:
         raise ValueError("expected a physical-address module with the named user-data block")
@@ -307,6 +398,7 @@ def lower(assembly):
     physical_qwords = set()
     physical_ints = set()
     physical_floats = set()
+    physical_vec4s = set()
     for line in lines:
         cast = CAST.fullmatch(line)
         access = ACCESS.fullmatch(line)
@@ -315,6 +407,8 @@ def lower(assembly):
             physical_ints.add((cast or SIGNED_ACCESS.fullmatch(line))[1])
         if cast and cast[2] == "float" or FLOAT_ACCESS.fullmatch(line):
             physical_floats.add((cast or FLOAT_ACCESS.fullmatch(line))[1])
+        if cast and cast[2] == "v4float" or VEC4_ACCESS.fullmatch(line):
+            physical_vec4s.add((cast or VEC4_ACCESS.fullmatch(line))[1])
         if access or cast and cast[2] == "uint":
             physical_words.add((access or cast)[1])
         if wide or cast and cast[2] == "ulong":
@@ -335,11 +429,25 @@ def lower(assembly):
     if physical_floats or any(cast and cast[2] == "arrf" for cast in map(CAST.fullmatch, lines)):
         if not set(FLOAT_POINTER_TYPES + FLOAT_ARRAY_DECLARATIONS) <= set(lines):
             raise ValueError("unsupported physical pointer or scalar layout")
+    vec4_arrays = {}
+    vec4_words = {}
+    vec4_stores = 0
+    uses_vec4 = bool(physical_vec4s) or any(cast and cast[2] == "arrv4f" for cast in map(CAST.fullmatch, lines))
+    if uses_vec4 and not set(VEC4_POINTER_TYPES + VEC4_ARRAY_DECLARATIONS) <= set(lines):
+        raise ValueError("unsupported physical pointer or scalar layout")
     if physical_qwords:
         declarations += ["%x2w_one = OpConstant %uint 1", "%x2w_shift_wide = OpConstant %uint 3",
                          "%x2w_shift_half = OpConstant %uint 32", "%x2w_mask_wide = OpConstant %ulong 7",
                          # The last valid QWORD ends at the same DWORD as the last valid DWORD access.
                          "%x2w_end_wide = OpConstant %ulong 4294967288"]
+    if uses_vec4:
+        # A 16-byte access is valid up to the last aligned address whose final DWORD is below the window end, so the
+        # end is the window end less twelve; a misaligned or straddling access is refused as a whole.
+        declarations += ["%x2w_shift_vec4 = OpConstant %uint 4", "%x2w_mask_vec4 = OpConstant %ulong 15",
+                         "%x2w_end_vec4 = OpConstant %ulong 4294967280", "%x2w_two = OpConstant %uint 2",
+                         "%x2w_three = OpConstant %uint 3", "%x2w_vec4_zero = OpConstantNull %v4float"]
+        if not physical_qwords:
+            declarations.append("%x2w_one = OpConstant %uint 1")
     # A guarded access splits its block, which would strand an OpLoopMerge in the generated merge block.
     loop_headers, start = set(), 0
     for number, line in enumerate(lines):
@@ -347,6 +455,10 @@ def lower(assembly):
             start = number
         elif line.startswith("OpLoopMerge "):
             loop_headers.update(range(start, number))
+    wide_types = {m[1]: "s64" if m[2] == "1" else "u64"
+                  for m in map(re.compile(rf"({ID}) = OpTypeInt 64 ([01])").fullmatch, lines) if m}
+    wide_ids = {m[1]: wide_types[m[2]]
+                for m in map(re.compile(rf"({ID}) = Op\w+ ({ID})").match, lines) if m and m[2] in wide_types}
     constants = {m[1]: int(m[2]) for m in map(CONSTANT.fullmatch, lines) if m}
     failures = {}
     for line in lines:
@@ -359,7 +471,8 @@ def lower(assembly):
     for number, line in enumerate(lines):
         if line in ('OpExtension "SPV_KHR_physical_storage_buffer"', "OpCapability PhysicalStorageBufferAddresses",
                     "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
-                    WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE, *SIGNED_POINTER_TYPES, *FLOAT_POINTER_TYPES):
+                    WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE, *SIGNED_POINTER_TYPES, *FLOAT_POINTER_TYPES,
+                    *VEC4_POINTER_TYPES):
             continue
         if line.startswith("OpDecorate ") and annotations:
             output.extend(annotations)
@@ -377,6 +490,12 @@ def lower(assembly):
                 signed_arrays[dst] = addr
             elif kind == "arrf":
                 float_arrays[dst] = addr
+            elif kind == "arrv4f":
+                vec4_arrays[dst] = addr
+            elif kind == "v4float":
+                new, valid_of[dst] = word_pointer(dst, addr, None, "vec4")
+                vec4_words[dst] = address_name(dst) + "_word"
+                output.extend(new)
             elif kind == "float":
                 new, valid_of[dst] = word_pointer(dst, addr, None, defer=True)
                 float_words[dst] = address_name(dst) + "_word"
@@ -397,14 +516,14 @@ def lower(assembly):
             dst, pointer, index = access.groups()
             if pointer not in arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, arrays[pointer], index)
+            new, valid_of[dst] = word_pointer(dst, arrays[pointer], index, index_kind=wide_ids.get(index))
             output.extend(new)
             continue
         if signed := SIGNED_ACCESS.fullmatch(line):
             dst, pointer, index = signed.groups()
             if pointer not in signed_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, signed_arrays[pointer], index, defer=True)
+            new, valid_of[dst] = word_pointer(dst, signed_arrays[pointer], index, defer=True, index_kind=wide_ids.get(index))
             signed_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
@@ -412,15 +531,23 @@ def lower(assembly):
             dst, pointer, index = floating.groups()
             if pointer not in float_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, float_arrays[pointer], index, defer=True)
+            new, valid_of[dst] = word_pointer(dst, float_arrays[pointer], index, defer=True, index_kind=wide_ids.get(index))
             float_words[dst] = address_name(dst) + "_word"
+            output.extend(new)
+            continue
+        if quad := VEC4_ACCESS.fullmatch(line):
+            dst, pointer, index = quad.groups()
+            if pointer not in vec4_arrays:
+                raise ValueError("unknown physical array pointer")
+            new, valid_of[dst] = word_pointer(dst, vec4_arrays[pointer], index, "vec4", index_kind=wide_ids.get(index))
+            vec4_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
         if wide := WIDE_ACCESS.fullmatch(line):
             dst, pointer, index = wide.groups()
             if pointer not in wide_arrays:
                 raise ValueError("unknown physical array pointer")
-            new, valid_of[dst] = word_pointer(dst, wide_arrays[pointer], index, True)
+            new, valid_of[dst] = word_pointer(dst, wide_arrays[pointer], index, True, index_kind=wide_ids.get(index))
             wide_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
@@ -428,7 +555,7 @@ def lower(assembly):
             label = origin = opened[1]
         ids = set(re.findall(ID, line))
         wide_used = ids & physical_qwords
-        if (wide_used or ids & (physical_ints | physical_floats)) and number in loop_headers:
+        if (wide_used or ids & (physical_ints | physical_floats | physical_vec4s)) and number in loop_headers:
             raise ValueError("a guarded physical access cannot share a block with OpLoopMerge")
         if wide_used:
             fields = line.split()
@@ -443,6 +570,16 @@ def lower(assembly):
             pointer = fields[4] if wide_load else fields[1]
             stem = "%x2w_" + (f"load_{fields[0][1:]}" if wide_load else f"store_{wide_accesses}")
             new, label = wide_access(kind, stem, valid_of[pointer], label, wide_words[pointer], fields)
+            final_label[origin] = label
+            output.extend(new)
+            continue
+        if ids & physical_vec4s:
+            if ids & (physical_words | physical_qwords | physical_ints | physical_floats):
+                raise ValueError("unhandled physical word pointer use")
+            fields = line.split()
+            vec4_stores += fields[0] == "OpStore"
+            stem = "%x2w_vec4_" + (f"result_{fields[0][1:]}" if fields[0] != "OpStore" else f"store_{vec4_stores}")
+            new, label = vec4_access(fields, ids & physical_vec4s, valid_of, vec4_words, label, stem)
             final_label[origin] = label
             output.extend(new)
             continue
@@ -508,7 +645,7 @@ def lower(assembly):
                 raise ValueError("unrecognized push-constant declaration")
             line = line.replace("PushConstant", "StorageBuffer")
         elif any(word in line for word in ("PhysicalStorageBuffer", "OpConvertUToPtr", "OpConvertPtrToU", "%_ptr_PSB_arr",
-                                                  "%_ptr_PSB_float")):
+                                                  "%_ptr_PSB_float", "%_ptr_PSB_v4float")):
             raise ValueError("unhandled physical pointer operation")
         if " = OpPhi " in line:
             source_phis.append(len(output))
@@ -520,32 +657,69 @@ def lower(assembly):
     return merge_pointer_types(output)
 
 
-def main():
+def _same_path(left: Path, right: Path) -> bool:
+    if left.resolve() == right.resolve():
+        return True
+    if left.exists() and right.exists():
+        return left.samefile(right)
+    return False
+
+
+def _validate_args(args: argparse.Namespace) -> tuple[str, str]:
+    if _same_path(args.output, args.source):
+        raise ValueError("use separate input assembly and output binary paths")
+    if args.source.is_dir():
+        raise IsADirectoryError(f"source path must not be a directory: {args.source}")
+    if not args.source.exists():
+        raise FileNotFoundError(f"source file not found: {args.source}")
+    if not args.source.is_file():
+        raise ValueError(f"source path must be a regular file: {args.source}")
+    if args.output.is_symlink():
+        raise ValueError(f"output path must not be a symlink: {args.output}")
+    if args.output.is_dir():
+        raise IsADirectoryError(f"output path must not be a directory: {args.output}")
+    for parent in args.output.parents:
+        if parent.is_file() or ((parent.exists() or parent.is_symlink()) and not parent.is_dir()):
+            raise NotADirectoryError(f"output parent is not a directory: {parent}")
+    assembler = args.assembler.strip()
+    if not assembler:
+        raise ValueError("--assembler must be a non-empty string")
+    validator = args.validator.strip()
+    if not validator:
+        raise ValueError("--validator must be a non-empty string")
+    return assembler, validator
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--assembler", default="spirv-as")
     parser.add_argument("--validator", default="spirv-val")
-    args = parser.parse_args()
-    if args.output.resolve() == args.source.resolve():
-        parser.error("use separate input assembly and output binary paths")
-    original = args.source.read_text(encoding="utf-8")
-    with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
-        path = Path(directory)
-        binary = path / "module.spv"
+    args = parser.parse_args(argv)
+    try:
+        assembler, validator = _validate_args(args)
+        original = args.source.read_text(encoding="utf-8")
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=args.output.parent) as directory:
+            path = Path(directory)
+            binary = path / "module.spv"
 
-        def validate(source):
-            subprocess.run([args.assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
-            subprocess.run([args.validator, "--target-env", "vulkan1.2", binary], check=True)
+            def validate(source):
+                subprocess.run([assembler, "--target-env", "vulkan1.2", source, "-o", binary], check=True)
+                subprocess.run([validator, "--target-env", "vulkan1.2", binary], check=True)
 
-        snapshot = path / "original.spvasm"
-        snapshot.write_text(original, encoding="utf-8")
-        validate(snapshot)
-        adapted = path / "logical.spvasm"
-        adapted.write_text(lower(original), encoding="utf-8")
-        validate(adapted)
-        binary.replace(args.output)
+            snapshot = path / "original.spvasm"
+            snapshot.write_text(original, encoding="utf-8")
+            validate(snapshot)
+            adapted = path / "logical.spvasm"
+            adapted.write_text(lower(original), encoding="utf-8")
+            validate(adapted)
+            binary.replace(args.output)
+    except (OSError, UnicodeDecodeError, ValueError, subprocess.SubprocessError) as error:
+        parser.exit(1, f"error: {error}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

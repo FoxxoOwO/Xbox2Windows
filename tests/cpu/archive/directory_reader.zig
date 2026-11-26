@@ -1,5 +1,5 @@
 extern "archive_directory_gpu" fn directory_input() callconv(.C) ?*const Inputs;
-extern "archive_directory_gpu" fn enqueue_page(index: u32, offset: u64, size: u32) callconv(.C) u32;
+extern "archive_directory_gpu" fn enqueue_page(index: u32, offset: u64, size: u32, destination: u64) callconv(.C) u32;
 extern "archive_directory_gpu" fn draw_pages() callconv(.C) u32;
 
 // Readable prefix of a fixture file, its full size, and two requested logical pages.
@@ -27,7 +27,7 @@ fn validate(input: *const Inputs) u32 {
     return @intCast(count);
 }
 
-// The queue consumes one complete page per request. Only exact one-page zlib ranges qualify.
+// The source-built renderer consumes one 4 KiB page from a one- or sixteen-page zlib interval.
 export fn locate(table: [*]const u64, count: usize, page: u32) callconv(.C) u32 {
     var low: usize = 0;
     var high: usize = count - 1;
@@ -37,19 +37,24 @@ export fn locate(table: [*]const u64, count: usize, page: u32) callconv(.C) u32 
     }
     const word = table[low];
     const next = table[low + 1];
-    if (logical(word) != page or logical(next) - logical(word) != 1 or (word >> 26 & 15) != 8) return 0;
+    const pages = logical(next) - logical(word);
+    if (page < logical(word) or page >= logical(next) or (pages != 1 and pages != 16) or (word >> 26 & 15) != 8) return 0;
     const span = physical(next) - physical(word);
     const padding = word >> 52;
     if (span <= padding or span - padding > 0xffffffff) return 0;
     return @intCast(low);
 }
 
-noinline fn queueRecord(table: [*]const u64, index: u32, bias: u64) bool {
+noinline fn queueRecord(table: [*]const u64, index: u32, page: u32, bias: u64) bool {
     const word = table[index];
     const start = physical(word);
-    const size: u32 = @intCast(physical(table[@as(usize, index) + 1]) - start - (word >> 52));
+    const next = table[@as(usize, index) + 1];
+    const size: u32 = @intCast(physical(next) - start - (word >> 52));
+    const capacity = (logical(next) - logical(word)) << 12;
+    const offset_in_output = (@as(u64, page) - logical(word)) << 12;
+    const destination = (capacity << 32) | offset_in_output;
     const address = @addWithOverflow(start, bias);
-    return address[1] == 0 and enqueue_page(index, address[0], size) == size;
+    return address[1] == 0 and enqueue_page(index, address[0], size, destination) == size;
 }
 
 pub fn main() u8 {
@@ -60,6 +65,6 @@ pub fn main() u8 {
     const first = locate(table, count, input.first);
     const second = locate(table, count, input.second);
     if (first == 0 or second == 0) return 3;
-    if (!queueRecord(table, first, input.bias) or !queueRecord(table, second, 0)) return 4;
+    if (!queueRecord(table, first, input.first, input.bias) or !queueRecord(table, second, input.second, 0)) return 4;
     return @truncate(draw_pages());
 }

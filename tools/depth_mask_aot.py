@@ -2,6 +2,9 @@
 
 import argparse
 import re
+import struct
+import tempfile
+import zlib
 from pathlib import Path
 
 from pixel_aot import container_code, disassemble
@@ -22,9 +25,9 @@ BINARY_F32 = {
 
 
 # One-source binary32 e32 forms with a VGPR, constant or scalar word source. round is round-half-even, like
-# v_rndne_f32. The result of rcp, rsq and sqrt is whatever the host computes: a caller may only rely on inputs
-# whose exact result is an integer, and a zero or negative operand is not claimed. Source modifiers, clamp,
-# output modifiers, a second source and the e64 encodings stay rejected.
+# v_rndne_f32. The result of rcp, rsq, sqrt, exp and log is whatever the host computes: a caller may only rely on inputs
+# whose exact result is an integer, and a zero or negative operand (or an overflow) is not claimed. Source modifiers, clamp,
+# output modifiers and a second source stay rejected; the e64 spelling is accepted only without modifiers (see plain).
 UNARY_F32 = {
     "v_rcp_f32_e32": "(1.0f / {x})",
     "v_rsq_f32_e32": "rsqrt({x})",
@@ -32,19 +35,56 @@ UNARY_F32 = {
     "v_floor_f32_e32": "floor({x})",
     "v_trunc_f32_e32": "trunc({x})",
     "v_rndne_f32_e32": "round({x})",
+    "v_ceil_f32_e32": "ceil({x})",
+    "v_exp_f32_e32": "exp2({x})",
+    "v_log_f32_e32": "log2({x})",
 }
 
 
 # Ordered binary32 compares that write EXEC with the lanes where the compare holds.
 # A lane for which src0 OP vsrc1 holds is discarded. Only the four ordered forms are
 # claimed: a NaN operand makes every one of them false, as the HLSL operators do. The
-# unordered (n*) forms are true for NaN and stay rejected, as do other widths and e64.
+# unordered (n*) forms are true for NaN and stay rejected, as do other widths and the VOP3 compares that write a scalar mask.
 CMPX_F32 = {
     "v_cmpx_lt_f32_e32": "<",
     "v_cmpx_le_f32_e32": "<=",
     "v_cmpx_gt_f32_e32": ">",
     "v_cmpx_ge_f32_e32": ">=",
 }
+
+
+# Plain VOP3 spellings. An _e64 instruction of exactly the forms above (the binary32 VOP2 and
+# VOP1 math, v_fract_f32, v_mul_legacy_f32, v_fmac_f32 and the four ordered v_cmpx_*_f32
+# compares) is the same operation as its _e32 spelling and is rewritten to it before lowering,
+# so both spellings give identical HLSL and take the same operand rules (a binary32 VOP2
+# vsrc1 stays a VGPR even though VOP3 would allow a scalar or constant there). Rejected VOP3
+# fields: clamp, omod (mul:2, div:2, mul:4), the abs ("|v1|") and neg ("-v1", "neg(v1)")
+# source modifiers, op_sel and every other suffix. Only a plain register, scalar word or
+# constant operand is accepted. A VOP3 compare with a scalar destination (v_cmp_*_e64) and
+# every other _e64 instruction are different instructions and are rejected.
+E64_FORMS = frozenset(
+    (
+        *BINARY_F32,
+        *UNARY_F32,
+        *CMPX_F32,
+        "v_fract_f32_e32",
+        "v_mul_legacy_f32_e32",
+        "v_fmac_f32_e32",
+    )
+)
+PLAIN_OPERAND = r"[vs]\d+|-?\d+(?:\.\d+)?|0x[0-9a-f]+"
+
+
+def plain(line):
+    op, _, operands = line.partition(" ")
+    if not op.endswith("_e64"):
+        return line
+    narrow = op[: -len("_e64")] + "_e32"
+    if narrow not in E64_FORMS:
+        raise ValueError(f"Unsupported depth instruction: {op}")
+    if not all(re.fullmatch(PLAIN_OPERAND, a) for a in operands.split(", ")):
+        raise ValueError(f"VOP3 modifier or unsupported operand: {line}")
+    return f"{narrow} {operands}"
 
 
 def lower(decoded, tables):
@@ -93,6 +133,7 @@ def lower(decoded, tables):
 
     index = 0
     for index, (_, line) in enumerate(decoded):
+        line = plain(line)
         if line.startswith("v_cmpx_"):
             break
         if re.fullmatch(r"s_(?:inst_prefetch|nop) (?:0x[0-9a-f]+|\d+)", line):
@@ -179,6 +220,8 @@ def lower(decoded, tables):
                 x, y = map(fp, args[1:])
                 expr = BINARY_F32[op](x, y)
             elif op == "v_fmac_f32_e32" and len(args) == 3:
+                if dest not in vector:
+                    raise ValueError("Unwritten vector register")
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
             elif op in UNARY_F32 and len(args) == 2:
                 expr = UNARY_F32[op].format(x=fp(args[1]))
@@ -197,6 +240,7 @@ def lower(decoded, tables):
     compare, invert, branch, restore, depth, end, empty, null, last = (
         s for _, s in tail
     )
+    compare = plain(compare)
     cmp = re.fullmatch(r"(v_cmpx_(?:lt|le|gt|ge)_f32_e32) (s\d+), (v\d+)", compare)
     inv = re.fullmatch(r"s_andn2_b64 (s\[(\d+):(\d+)\]), \1, exec", invert)
     take = re.fullmatch(r"s_cbranch_scc0 (-?\d+)", branch)
@@ -230,33 +274,65 @@ def lower(decoded, tables):
     return "\n".join(lines) + "\n"
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("container", type=Path)
-    p.add_argument("--llvm", required=True)
-    p.add_argument(
+def _parse_int(token: str) -> int:
+    return int(token, 0)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("container", type=Path)
+    parser.add_argument("--llvm", required=True)
+    parser.add_argument(
         "--table",
         action="append",
         nargs=2,
-        type=lambda t: int(t, 0),
+        type=_parse_int,
         required=True,
         metavar=("ENTRY_SGPR", "BYTE_OFFSET"),
         help="b0 then b1",
     )
-    p.add_argument("--output", type=Path, required=True)
-    a = p.parse_args()
-    if (
-        a.output.suffix.lower() != ".hlsl"
-        or a.output.resolve() == a.container.resolve()
-    ):
-        p.error("Choose an HLSL destination distinct from the input")
-    code = container_code(
-        parts(a.container.read_bytes())[b"DXIL"], stage=0, llvm=a.llvm
-    )
-    source = lower(disassemble(code, a.llvm, offsets=True), a.table)
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    a.output.write_text(source, encoding="ascii")
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if not args.table or any(sgpr < 0 or offset < 0 for sgpr, offset in args.table):
+        parser.error(
+            "Expected non-empty --table pairs with non-negative SGPR and byte offset"
+        )
+    try:
+        dest = args.output.resolve()
+        src = args.container.resolve()
+    except OSError as exc:
+        parser.exit(1, f"{exc}\n")
+    if dest.suffix.lower() != ".hlsl" or dest == src:
+        parser.error("Choose an HLSL destination distinct from the input")
+    tmp_path = None
+    try:
+        sections = parts(args.container.read_bytes())
+        if b"DXIL" not in sections:
+            raise ValueError("DXBC container has no DXIL part")
+        code = container_code(sections[b"DXIL"], stage=0, llvm=args.llvm)
+        source = lower(disassemble(code, args.llvm, offsets=True), args.table)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="ascii",
+            dir=dest.parent,
+            prefix=f".{dest.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_path = Path(handle.name)
+            handle.write(source)
+        tmp_path.replace(dest)
+    except (OSError, ValueError, struct.error, zlib.error) as exc:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        parser.exit(1, f"{exc}\n")
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

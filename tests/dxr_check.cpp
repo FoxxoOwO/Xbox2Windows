@@ -5,6 +5,7 @@
 #include "ray_candidates_pipeline.h"
 #include "ray_pipeline.h"
 #include "ray_query.h"
+#include "ray_query_table.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -153,6 +154,11 @@ static RayPipeline make_ray_pipeline(ID3D12Device5* device, ID3D12RootSignature*
 struct AddressScene {
     std::vector<Vertex> otherTriangle;
     bool truncate;
+    // title: build and instance addresses go through the title range table (the path under test).
+    // direct: the native control; the builds and the TLAS use the two BLAS GPU addresses without the table, and
+    //   with truncate both instances name the left BLAS explicitly.
+    // misroute_high: the title path, but the high instance is deliberately looked up at the low title base.
+    enum class Route { title, direct, misroute_high } route = Route::title;
 };
 constexpr UINT64 lowTitle = 0x2300000000ull;
 constexpr UINT64 highTitle = lowTitle + (1ull << 40);
@@ -265,6 +271,27 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
         otherVertices = bvh_fixture::upload(device, addressScene->otherTriangle);
         otherGeometry.Triangles.VertexBuffer.StartAddress = otherVertices->GetGPUVirtualAddress();
         otherBuild.Inputs.pGeometryDescs = &otherGeometry;
+        const UINT64 lowBlas = blas->GetGPUVirtualAddress() + prefix, highBlas = otherBlas->GetGPUVirtualAddress() + prefix;
+        if (addressScene->route == AddressScene::Route::direct) {
+            bottom.DestAccelerationStructureData = lowBlas;
+            otherBuild.DestAccelerationStructureData = highBlas;
+            for (auto& desc : instances) {
+                const UINT64 title = desc.AccelerationStructure;
+                if (title != lowTitle + prefix && title != highTitle + prefix)
+                    throw std::runtime_error("Direct DXR control expects the two fixture title addresses");
+                desc.AccelerationStructure = title == highTitle + prefix && !addressScene->truncate ? highBlas : lowBlas;
+            }
+        }
+    }
+    const bool decoy = placedScene && placedScene->misroute;
+    if (decoy) {
+        // A triangle 4 units right of the scene's, so the first ray misses whatever routes to it.
+        otherVertices = bvh_fixture::upload(device, std::vector<Vertex>{{3,-1,1}, {5,-1,1}, {4,1,1}});
+        otherGeometry.Triangles.VertexBuffer.StartAddress = otherVertices->GetGPUVirtualAddress();
+        otherBuild.Inputs.pGeometryDescs = &otherGeometry;
+        placedScene->prepare_decoy(bottom_size, otherBuild);
+    }
+    if (addressScene && addressScene->route != AddressScene::Route::direct) {
         era_title_va::Table ranges;
         if (!ranges.add(lowTitle, blasBytes, blas->GetGPUVirtualAddress()) ||
             !ranges.add(highTitle, blasBytes, otherBlas->GetGPUVirtualAddress()))
@@ -277,12 +304,15 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
             throw std::runtime_error("DXR range lookup lost the AS allocation or its interior offset");
         for (auto& desc : instances) {
             const UINT64 title = desc.AccelerationStructure;
-            const UINT64 key = addressScene->truncate ? title & ((1ull << 40) - 1) : title;
+            UINT64 key = addressScene->truncate ? title & ((1ull << 40) - 1) : title;
+            if (addressScene->route == AddressScene::Route::misroute_high && key == highTitle + prefix)
+                key = lowTitle + prefix;
             desc.AccelerationStructure = ranges.translate(key, bytes);
             if (!desc.AccelerationStructure) throw std::runtime_error("Unmapped fixture BLAS");
         }
-    } else {
-        for (auto& desc : instances) desc.AccelerationStructure = bottom.DestAccelerationStructureData;
+    } else if (!addressScene) {
+        const UINT64 target = decoy ? otherBuild.DestAccelerationStructureData : bottom.DestAccelerationStructureData;
+        for (auto& desc : instances) desc.AccelerationStructure = target;
     }
     auto instanceBuffer = bvh_fixture::upload(device, instances);
     top.Inputs.InstanceDescs = instanceBuffer->GetGPUVirtualAddress();
@@ -292,8 +322,15 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     auto results = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
     auto readback = make_buffer(device, result_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
     // Per-triangle geometries are traced by the shader that handles non-opaque candidates.
+    const bool viaView = placedScene && placedScene->slot70;
+    if (viaView && (usePipeline || triangleGeometries || update))
+        throw std::runtime_error("The slot-70 view fixture traces one placed scene with the inline query shader");
     const D3D12_SHADER_BYTECODE shader = triangleGeometries
-        ? D3D12_SHADER_BYTECODE{ray_candidates, sizeof(ray_candidates)} : D3D12_SHADER_BYTECODE{ray_query, sizeof(ray_query)};
+        ? D3D12_SHADER_BYTECODE{ray_candidates, sizeof(ray_candidates)}
+        : viaView ? D3D12_SHADER_BYTECODE{ray_query_table, sizeof(ray_query_table)}
+                  : D3D12_SHADER_BYTECODE{ray_query, sizeof(ray_query)};
+    ComPtr<ID3D12DescriptorHeap> asHeap;
+    if (viaView) asHeap = placedScene->publish_as_view(device);
     ComPtr<ID3D12RootSignature> root;
     // Both backends share the global root signature embedded in the compute shader.
     check(device->CreateRootSignature(0, shader.pShaderBytecode, shader.BytecodeLength, IID_PPV_ARGS(&root)),
@@ -323,7 +360,7 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     list->BuildRaytracingAccelerationStructure(&bottom, 0, nullptr);
     if (counts) ++counts->records;
     list->ResourceBarrier(1, &order);
-    if (addressScene) {
+    if (addressScene || decoy) {
         list->BuildRaytracingAccelerationStructure(&otherBuild, 0, nullptr);
         list->ResourceBarrier(1, &order);
     }
@@ -350,7 +387,13 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     order.UAV.pResource = tlas.Get();
     list->ResourceBarrier(1, &order);
     list->SetComputeRootSignature(root.Get());
-    list->SetComputeRootShaderResourceView(0, top.DestAccelerationStructureData);
+    if (asHeap) {
+        ID3D12DescriptorHeap* heaps[]{asHeap.Get()};
+        list->SetDescriptorHeaps(1, heaps);
+        list->SetComputeRootDescriptorTable(0, asHeap->GetGPUDescriptorHandleForHeapStart());
+    } else {
+        list->SetComputeRootShaderResourceView(0, top.DestAccelerationStructureData);
+    }
     list->SetComputeRootUnorderedAccessView(1, results->GetGPUVirtualAddress());
     list->SetComputeRootShaderResourceView(2, rayBuffer->GetGPUVirtualAddress());
     if (usePipeline) {
@@ -385,25 +428,67 @@ bool check_dxr_address_ranges(ID3D12Device* device) {
     high.AccelerationStructure = highTitle + asOffset;
     const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1},
                                {0,0,0,.01f,0,0,1,4,2}, {4,0,0,.01f,0,0,1,4,2}};
-    const auto probe = [&] {
+    const auto probe = [&](bool truncate, AddressScene::Route route) {
+        scene.truncate = truncate;
+        scene.route = route;
         return trace_scene(device, left, {low, high}, rays, Backend::pipeline, nullptr, nullptr, &scene);
     };
-    const auto full = probe();
-    scene.truncate = true;
-    const auto truncated = probe(); // Both instance masks now select the valid left BLAS.
-    constexpr bvh_fixture::Row miss{};
-    constexpr bvh_fixture::Row hitLow{1, 7, 0, 0x3f800000};
-    constexpr bvh_fixture::Row hitHigh{1, 11, 0, 0x40000000};
-    constexpr bvh_fixture::Row wrongHit{1, 11, 0, 0x3f800000};
-    const std::array<bvh_fixture::Row,4> expected{hitLow, miss, miss, hitHigh};
-    const std::array<bvh_fixture::Row,4> wrong{hitLow, miss, wrongHit, miss};
-    for (std::size_t i = 0; i < rays.size(); ++i) {
-        if (!std::equal(expected[i].begin(), expected[i].end(), full.begin() + 4 * i) ||
-            !std::equal(wrong[i].begin(), wrong[i].end(), truncated.begin() + 4 * i))
-            throw std::runtime_error("DXR address range or truncation-control mismatch at ray " + std::to_string(i));
-    }
-    std::puts("DXR address ranges: interior offset=512 full=[hit7@1,miss,miss,hit11@2] "
-              "truncated=[hit7@1,miss,hit11@1,miss]");
+    using Route = AddressScene::Route;
+    const auto full = probe(false, Route::title);
+    const auto truncated = probe(true, Route::title); // Both instance masks now select the valid left BLAS.
+    // The native control: the same triangles, masks, rays and transforms, with the BLAS GPU addresses given directly.
+    const auto directFull = probe(false, Route::direct);
+    const auto directTruncated = probe(true, Route::direct);
+    // Negative control: the high instance deliberately routed to the low backing.
+    const auto misrouted = probe(false, Route::misroute_high);
+    // Fixed geometry expectations: hit, instance ID and primitive per ray. The distance word is compared with the
+    // direct-address result below rather than with a constant, since a device may round t differently.
+    using Geometry = std::array<bvh_fixture::Word, 3>;
+    constexpr Geometry miss{0, 0, 0}, hitLow{1, 7, 0}, hitHigh{1, 11, 0};
+    const std::array<Geometry, 4> expected{hitLow, miss, miss, hitHigh};
+    const std::array<Geometry, 4> wrong{hitLow, miss, hitHigh, miss};
+    const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
+        std::printf("dxr_address_rows %s", label);
+        for (std::size_t i = 0; i + 3 < words.size(); i += 4)
+            std::printf(" [%u,%u,%u,0x%08x]", words[i], words[i + 1], words[i + 2], words[i + 3]);
+        std::puts("");
+    };
+    print("title_full", full);
+    print("direct_full", directFull);
+    print("title_truncated", truncated);
+    print("direct_truncated", directTruncated);
+    print("misroute_high", misrouted);
+    const auto distance = [](const std::vector<bvh_fixture::Word>& words, std::size_t ray) { return words[4 * ray + 3]; };
+    std::printf("dxr_address_distance ray0_t=0x%08x (1.0=0x3f800000) ray3_t=0x%08x (2.0=0x40000000) "
+                "truncated_ray2_t=0x%08x (1.0=0x3f800000)\n",
+                distance(full, 0), distance(full, 3), distance(truncated, 2));
+    const auto geometry_mismatch = [](const std::array<Geometry, 4>& rows, const std::vector<bvh_fixture::Word>& words) {
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (!std::equal(rows[i].begin(), rows[i].end(), words.begin() + 4 * i)) return static_cast<int>(i);
+        return -1;
+    };
+    const auto first_difference = [&](const std::vector<bvh_fixture::Word>& a, const std::vector<bvh_fixture::Word>& b) {
+        for (std::size_t i = 0; i < rays.size(); ++i)
+            if (!std::equal(a.begin() + 4 * i, a.begin() + 4 * i + 4, b.begin() + 4 * i)) return static_cast<int>(i);
+        return -1;
+    };
+    const auto fail = [](const char* what, int ray) {
+        throw std::runtime_error(std::string(what) + " at ray " + std::to_string(ray));
+    };
+    for (const auto* set : {&full, &directFull})
+        if (const int ray = geometry_mismatch(expected, *set); ray >= 0) fail("DXR address range geometry mismatch", ray);
+    for (const auto* set : {&truncated, &directTruncated})
+        if (const int ray = geometry_mismatch(wrong, *set); ray >= 0) fail("DXR truncation-control geometry mismatch", ray);
+    // All four words, distance bits included, must equal the native direct-address result.
+    if (const int ray = first_difference(full, directFull); ray >= 0)
+        fail("DXR title-range result differs from the direct-address control", ray);
+    if (const int ray = first_difference(truncated, directTruncated); ray >= 0)
+        fail("DXR truncation result differs from the direct-address truncation control", ray);
+    // The misrouted high instance must fail the same comparison, so it cannot pass by accident.
+    if (first_difference(misrouted, directFull) < 0)
+        throw std::runtime_error("Routing the high instance to the low backing still matched the direct control");
+    std::puts("DXR address ranges: interior offset=512 title rows equal direct-address rows (full and truncated), "
+              "misrouted high instance differs");
     return true;
 }
 
@@ -421,9 +506,85 @@ bool check_dxr_placed_build(ID3D12Device* device) {
     if (!supported(device, Backend::pipeline)) return false;
     PlacedBuildScene placement;
     const auto output = trace_placed_triangle(device, nullptr, &placement);
-    const std::vector<bvh_fixture::Word> expected{1,7,0,0x3f800000, 0,0,0,0, 0,0,0,0};
-    if (output != expected) throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
-    std::puts("Slot 133 placed BLAS/TLAS: hit7@1, miss, masked miss; 12/12 words matched");
+    // The reference (issue #874): the same geometry, build and instance inputs, rays and readback on the same
+    // adapter, with desktop GPU addresses given directly; only the placed-address resolver is bypassed.
+    const auto direct = trace_placed_triangle(device, nullptr, nullptr);
+    // Wrong-routing control: the instance routed to a decoy BLAS placed through the same resolver.
+    PlacedBuildScene misrouted_placement;
+    misrouted_placement.misroute = true;
+    const auto misrouted = trace_placed_triangle(device, nullptr, &misrouted_placement);
+    const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
+        std::printf("placed_dxr_rows %s", label);
+        for (std::size_t i = 0; i + 3 < words.size(); i += 4)
+            std::printf(" [%u,%u,%u,0x%08x]", words[i], words[i + 1], words[i + 2], words[i + 3]);
+        std::puts("");
+    };
+    print("placed", output);
+    print("direct", direct);
+    print("misrouted", misrouted);
+    // Fixed expectations: hit7, miss, masked miss with zero miss rows. The hit distance is compared with the
+    // adapter's direct-address result instead of a constant and reported against the mathematical 1.0.
+    const std::vector<bvh_fixture::Word> expected{1,7,0,0, 0,0,0,0, 0,0,0,0};
+    const auto fixed = [&](const std::vector<bvh_fixture::Word>& words) {
+        if (words.size() != expected.size()) return false;
+        for (std::size_t i = 0; i < words.size(); ++i)
+            if (i != 3 && words[i] != expected[i]) return false;
+        return true;
+    };
+    if (!fixed(output) || !fixed(direct))
+        throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7, miss, masked miss");
+    std::printf("placed_dxr_distance placed=0x%08x direct=0x%08x (1.0=0x3f800000)\n", output[3], direct[3]);
+    if (output != direct)
+        throw std::runtime_error("Placed BLAS/TLAS rays differ from the direct-address reference");
+    if (misrouted == direct)
+        throw std::runtime_error("Routing the instance to the decoy BLAS still matched the direct reference");
+    std::printf("Slot 133 placed BLAS/TLAS: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
+                "direct-address reference, decoy routing differs\n", output[3]);
+    return true;
+}
+
+// Device slot 70 (issue #1938): the TLAS is placed at a nonzero offset, published as an acceleration-structure
+// view through slot 70 and consumed from a descriptor table by an inline ray query, on the same adapter.
+bool check_dxr_slot70_as(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    if (!supported(device, Backend::inline_query)) return false;
+    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
+    const auto run = [&](bool misroute) {
+        PlacedBuildScene placement;
+        placement.slot70 = true;
+        placement.misroute = misroute;
+        return trace_scene(device, vertices, {instance(7,1)}, rays, Backend::inline_query,
+                           nullptr, nullptr, nullptr, &placement);
+    };
+    const auto viaView = run(false);
+    // The reference: the same builds and rays with the TLAS GPU address given as a root SRV; only slot 70 is bypassed.
+    const auto root = trace(device, vertices, {instance(7,1)}, rays);
+    // Distinct-AS control: the view names a TLAS whose instance routes to a decoy BLAS.
+    const auto decoy = run(true);
+    const auto print = [](const char* label, const std::vector<bvh_fixture::Word>& words) {
+        std::printf("slot70_as_rows %s", label);
+        for (std::size_t i = 0; i + 3 < words.size(); i += 4)
+            std::printf(" [%u,%u,%u,0x%08x]", words[i], words[i + 1], words[i + 2], words[i + 3]);
+        std::puts("");
+    };
+    print("view", viaView);
+    print("root", root);
+    print("decoy", decoy);
+    const std::vector<bvh_fixture::Word> expected{1,7,0,0, 0,0,0,0, 0,0,0,0};
+    const auto fixed = [&](const std::vector<bvh_fixture::Word>& words) {
+        if (words.size() != expected.size()) return false;
+        for (std::size_t i = 0; i < words.size(); ++i)
+            if (i != 3 && words[i] != expected[i]) return false;
+        return true;
+    };
+    if (!fixed(viaView) || !fixed(root))
+        throw std::runtime_error("Slot-70 view rays differ from hit7, miss, masked miss");
+    if (viaView != root)
+        throw std::runtime_error("Slot-70 view rays differ from the root-address reference");
+    if (decoy == root) throw std::runtime_error("The decoy-routed view still matched the reference");
+    std::printf("Slot 70 acceleration-structure view: hit7 (distance=0x%08x), miss, masked miss; all 12 words equal the "
+                "root-address reference after three refused calls kept the descriptor and the decoy differs\n", viaView[3]);
     return true;
 }
 

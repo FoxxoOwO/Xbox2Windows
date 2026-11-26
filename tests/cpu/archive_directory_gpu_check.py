@@ -28,10 +28,14 @@ def solid_pages():
     return group[0], different_length, group[-1]
 
 
+def runners(mapper, native, lifted, provider):
+    mapped = [sys.executable, "-B", Path(__file__).with_name("archive_check.py"), "--mapped", mapper, native, provider]
+    return {"native": [native], "pe_map": mapped, "AOT": [lifted]}
+
+
 def check(mapper, native, lifted, provider):
     first, second, decoy = solid_pages()
-    mapped = [sys.executable, "-B", Path(__file__).with_name("archive_check.py"), "--mapped", mapper, native, provider]
-    commands = {"native": [native], "pe_map": mapped, "AOT": [lifted]}
+    commands = runners(mapper, native, lifted, provider)
     adapter = None
     env = dict(os.environ, X2W_XMEM_PERMISSIVE="1")
     with tempfile.TemporaryDirectory() as workspace:
@@ -100,9 +104,11 @@ def check(mapper, native, lifted, provider):
                     trace = report.read_text().splitlines()
                     pos, size = directory[i]
                     next_pos, next_size = directory[j]
+                    assert trace.pop() == "storage release 0 0 0"
                     expected = [f"file {selected_file.stat().st_ino & 0xffffffffffffffff:016x}",
-                                f"request {i+1} {pos+bias} {size}", f"request {j+1} {next_pos} {next_size}",
-                                "status 00000000" if a else "status 80004005", "status 00000000"]
+                                # only the EOF case has no destination page: ERROR_HANDLE_EOF
+                                f"request {i+1} {pos+bias} {size} {PAGE} 0", f"request {j+1} {next_pos} {next_size} {PAGE} 0",
+                                "status 00000000" if a else "status 80070026", "status 00000000"]
                     assert trace[:5] == expected, (runner, mode, trace, expected)
                     assert pages.read_bytes() == ((a[1] if a else b"\xa5" * PAGE) + b[1]), (runner, mode, "BC pages")
                     if a:

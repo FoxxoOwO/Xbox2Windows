@@ -481,4 +481,63 @@ ENDIF
     ret
 root_const_sd ENDP
 
+; uint64_t round_cvt(float f, double d, uint8_t* out)
+; CVTSS2SI and CVTSD2SI into 32-bit and 64-bit registers from a register and from memory; the 32-bit forms start from
+; all ones, so a destination that keeps its upper half shows. The words of out hold the results; f and d sit at +40
+; and +48. SWAP_OPERANDS converts d where the first conversion converts f.
+round_cvt PROC FRAME
+    .endprolog
+    mov rax, -1
+    mov rcx, -1
+    mov r9, -1
+    mov r10, -1
+    movss DWORD PTR [r8+40], xmm0
+    movsd QWORD PTR [r8+48], xmm1
+IFDEF SWAP_OPERANDS
+    cvtsd2si eax, xmm1
+ELSE
+    cvtss2si eax, xmm0
+ENDIF
+    cvtsd2si ecx, xmm1
+    cvtss2si rdx, xmm0
+    cvtsd2si r11, xmm1
+    cvtss2si r9d, DWORD PTR [r8+40]
+    cvtsd2si r10d, QWORD PTR [r8+48]
+    mov QWORD PTR [r8], rax
+    mov QWORD PTR [r8+8], rcx
+    mov QWORD PTR [r8+16], rdx
+    mov QWORD PTR [r8+24], r11
+    mov QWORD PTR [r8+32], r9
+    mov QWORD PTR [r8+56], r10
+    cvtss2si rdx, DWORD PTR [r8+40]
+    mov QWORD PTR [r8+64], rdx
+    cvtsd2si rdx, QWORD PTR [r8+48]
+    mov QWORD PTR [r8+72], rdx
+    ret
+round_cvt ENDP
+
+; uint64_t movq_gpr(double d, uint64_t q)
+; Round-trips 64-bit values across XMM and 64-bit GPRs via MOVQ (encoded with DB bytes
+; for MASM portability across ML64 versions). Returns d_bits XOR q (or d_bits + q in
+; the SWAP_OPERANDS control), preserving all 64 bits across -0.0, NaNs, subnormals, and +/-inf.
+movq_gpr PROC FRAME
+    .endprolog
+    ; movq r9, xmm0
+    DB 66h, 49h, 0Fh, 7Eh, 0C1h
+    ; movq xmm2, r9
+    DB 66h, 49h, 0Fh, 6Eh, 0D1h
+    ; movq rax, xmm2
+    DB 66h, 48h, 0Fh, 7Eh, 0D0h
+    ; movq xmm3, rdx
+    DB 66h, 48h, 0Fh, 6Eh, 0DAh
+    ; movq r10, xmm3
+    DB 66h, 49h, 0Fh, 7Eh, 0DAh
+IFDEF SWAP_OPERANDS
+    add rax, r10
+ELSE
+    xor rax, r10
+ENDIF
+    ret
+movq_gpr ENDP
+
 END
